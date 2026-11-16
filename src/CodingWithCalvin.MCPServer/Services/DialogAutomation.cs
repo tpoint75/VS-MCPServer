@@ -29,6 +29,12 @@ namespace CodingWithCalvin.MCPServer.Services;
 /// stops responding is still listed, just without its contents.
 /// </para>
 /// <para>
+/// Some providers refuse Invoke with UIA_E_INVALIDOPERATION, which arrives as an
+/// <see cref="InvalidOperationException"/>; Visual Studio's own message boxes ("This project is out
+/// of date") do. A button with a native window is then clicked by window messages instead
+/// (<see cref="ClickNative"/>).
+/// </para>
+/// <para>
 /// A window counts as a blocking dialog when it is visible and enabled and its owner has been
 /// disabled, which is how both Win32 and WPF implement modality, or when it is a native dialog
 /// with no owner. Windows belonging to other processes are included when a Visual Studio window
@@ -66,6 +72,11 @@ internal sealed class DialogAutomation
     };
 
     private readonly int _processId;
+
+    /// <summary>
+    /// Clicks a button through UI Automation; replaceable so that tests can make it refuse.
+    /// </summary>
+    internal Func<AutomationElement, bool> Invoker { get; set; } = Invoke;
 
     internal DialogAutomation()
         : this((int)NativeMethods.GetCurrentProcessId())
@@ -144,7 +155,7 @@ internal sealed class DialogAutomation
         try
         {
             var element = content.Elements[index];
-            var click = await RunWithTimeoutAsync(() => Invoke(element), ClickTimeout).ConfigureAwait(false);
+            var click = await RunWithTimeoutAsync(() => Invoker(element), ClickTimeout).ConfigureAwait(false);
 
             if (click.Completed && !click.Result)
             {
@@ -174,6 +185,18 @@ internal sealed class DialogAutomation
             result.Message = "The button was no longer available to click.";
             result.OpenDialogs = (await GetDialogsAsync().ConfigureAwait(false)).Dialogs;
             return result;
+        }
+        catch (Exception ex) when (ex is InvalidOperationException || ex is COMException)
+        {
+            // The provider refused Invoke (UIA_E_INVALIDOPERATION): the native button by window messages.
+            if (!ClickNative(content.Handles[index]))
+            {
+                result.Message = $"UI Automation refused to click \"{result.Button}\" ({ex.GetType().Name}: {ex.Message}) and the button has no native window to click instead.";
+                result.OpenDialogs = (await GetDialogsAsync().ConfigureAwait(false)).Dialogs;
+                return result;
+            }
+
+            result.Clicked = true;
         }
 
         result.DialogClosed = await WaitForCloseAsync(window.Handle).ConfigureAwait(false);
@@ -345,6 +368,31 @@ internal sealed class DialogAutomation
         return key.TrimEnd();
     }
 
+    /// <summary>
+    /// Clicks a native button by window messages: in a dialog box WM_COMMAND with the button's
+    /// control id (BN_CLICKED), which works whether or not the dialog is active, otherwise BM_CLICK.
+    /// Posted, so a handler that opens another dialog cannot block the caller. False: no native button.
+    /// </summary>
+    internal static bool ClickNative(IntPtr button)
+    {
+        if (button == IntPtr.Zero || !NativeMethods.IsWindow(button))
+        {
+            return false;
+        }
+
+        var parent = NativeMethods.GetParent(button);
+        var id = NativeMethods.GetDlgCtrlID(button);
+        var className = new StringBuilder(256);
+        NativeMethods.GetClassName(parent, className, className.Capacity);
+
+        if (parent != IntPtr.Zero && id != 0 && string.Equals(className.ToString(), NativeDialogClassName, StringComparison.Ordinal))
+        {
+            return NativeMethods.PostMessage(parent, NativeMethods.WM_COMMAND, new IntPtr(id), button); // BN_CLICKED = 0 in the high word
+        }
+
+        return NativeMethods.PostMessage(button, NativeMethods.BM_CLICK, IntPtr.Zero, IntPtr.Zero);
+    }
+
     internal static string FormatId(IntPtr handle) =>
         "0x" + handle.ToInt64().ToString("X8", CultureInfo.InvariantCulture);
 
@@ -491,6 +539,11 @@ internal sealed class DialogAutomation
         /// The automation element behind each entry in <see cref="Buttons"/>, at the same index.
         /// </summary>
         public List<AutomationElement> Elements { get; } = new();
+
+        /// <summary>
+        /// The native window of each button (zero for windowless ones as in WPF), at the same index.
+        /// </summary>
+        public List<IntPtr> Handles { get; } = new();
     }
 
     /// <param name="title">The caption already read from Win32, preferred over UI Automation's.</param>
@@ -533,6 +586,7 @@ internal sealed class DialogAutomation
                     {
                         content.Buttons.Add(new DialogButtonInfo { Name = name!, IsEnabled = current.IsEnabled });
                         content.Elements.Add(element);
+                        content.Handles.Add(new IntPtr(current.NativeWindowHandle));
                     }
 
                     continue;
@@ -658,6 +712,8 @@ internal sealed class DialogAutomation
     private static class NativeMethods
     {
         public const int GWL_EXSTYLE = -20;
+        public const uint WM_COMMAND = 0x0111;
+        public const uint BM_CLICK = 0x00F5;
         public const int WS_EX_NOACTIVATE = 0x08000000;
         public const uint GW_OWNER = 4;
 
@@ -696,5 +752,15 @@ internal sealed class DialogAutomation
 
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         public static extern int InternalGetWindowText(IntPtr hWnd, StringBuilder pString, int cchMaxCount);
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetParent(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        public static extern int GetDlgCtrlID(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
     }
 }

@@ -290,24 +290,62 @@ public class DialogAutomationTests
 
         var dialog = await WaitForDialogAsync(automation, host, Title);
 
+        // Yes, No, Cancel in the language of Windows ("Ja, Nein, Abbrechen" on a German one).
+        var names = dialog.Buttons.Select(b => b.Name).ToArray();
+
         Assert.Null(dialog.Note);
         Assert.Equal("The source code is different from the original version.", dialog.Message);
-        Assert.Equal(new[] { "Yes", "No", "Cancel" }, dialog.Buttons.Select(b => b.Name).ToArray());
+        Assert.Equal(3, names.Length);
         Assert.All(dialog.Buttons, button => Assert.True(button.IsEnabled));
 
         var unknown = await automation.RespondAsync("Maybe", dialog.Id);
 
         Assert.False(unknown.Clicked);
-        Assert.Contains("Yes, No, Cancel", unknown.Message);
+        Assert.Contains(string.Join(", ", names), unknown.Message);
         Assert.Contains(unknown.OpenDialogs, open => open.Id == dialog.Id);
 
-        var response = await automation.RespondAsync("no", dialog.Id);
+        var response = await automation.RespondAsync(names[1].ToLowerInvariant(), dialog.Id);
 
         Assert.True(response.Clicked, response.Message);
-        Assert.Equal("No", response.Button);
+        Assert.Equal(names[1], response.Button);
         Assert.True(response.DialogClosed, response.Message);
         Assert.DoesNotContain(response.OpenDialogs, open => open.Id == dialog.Id);
         Assert.Equal(Forms.DialogResult.No, host.WaitForResult());
+    }
+
+    [Fact]
+    public async Task MessageBox_IsAnsweredByWindowMessage_WhenUiAutomationRefusesTheClick()
+    {
+        const string Title = "Out of date dialog test";
+
+        // As Visual Studio's own message boxes: the provider refuses Invoke (UIA_E_INVALIDOPERATION).
+        var automation = new DialogAutomation { Invoker = _ => throw new InvalidOperationException() };
+
+        using var host = new DialogThread(() =>
+        {
+            using var owner = new Forms.Form();
+            _ = owner.Handle;
+
+            return Forms.MessageBox.Show(
+                owner,
+                "This project is out of date.",
+                Title,
+                Forms.MessageBoxButtons.YesNoCancel,
+                Forms.MessageBoxIcon.Question);
+        });
+
+        var dialog = await WaitForDialogAsync(automation, host, Title);
+        var response = await automation.RespondAsync(dialog.Buttons[2].Name, dialog.Id); // Cancel in any language
+
+        Assert.True(response.Clicked, response.Message);
+        Assert.True(response.DialogClosed, response.Message);
+        Assert.Equal(Forms.DialogResult.Cancel, host.WaitForResult());
+    }
+
+    [Fact]
+    public void ClickNative_WithoutWindow_ReturnsFalse()
+    {
+        Assert.False(DialogAutomation.ClickNative(IntPtr.Zero));
     }
 
     [Fact]
